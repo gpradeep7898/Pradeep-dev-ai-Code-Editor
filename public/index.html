@@ -1,0 +1,153 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>MyIDE v2 ✦ AI-Powered Editor</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@300;400;500;700&family=Syne:wght@400;600;700;800&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="css/style.css">
+</head>
+<body>
+
+<!-- TOP BAR -->
+<header class="topbar">
+  <div class="topbar-left">
+    <span class="logo">✦ MyIDE</span>
+    <button class="btn-ghost" id="btnOpenFolder">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/></svg>
+      Open Folder
+    </button>
+    <button class="btn-ghost" id="btnNewFile">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="12" y1="18" x2="12" y2="12"/><line x1="9" y1="15" x2="15" y2="15"/></svg>
+      New File
+    </button>
+    <button class="btn-ghost" id="btnSave">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M19 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11l5 5v11a2 2 0 0 1-2 2z"/><polyline points="17 21 17 13 7 13 7 21"/><polyline points="7 3 7 8 15 8"/></svg>
+      Save
+    </button>
+  </div>
+  <div class="topbar-center">
+    <span id="currentFilePath" class="filepath">No file open</span>
+  </div>
+  <div class="topbar-right">
+    <div class="model-switcher">
+      <button class="model-btn active" id="btnClaude" data-model="claude">◆ Claude</button>
+      <button class="model-btn" id="btnGPT" data-model="gpt">⬡ GPT-4o</button>
+    </div>
+    <div class="status-dot" id="statusDot"></div>
+  </div>
+</header>
+
+<!-- FEATURE BAR -->
+<div class="feature-bar" id="featureBar">
+  <!-- Rendered by features.js -->
+  <span style="color:var(--text-muted);font-size:11px;padding:0 12px">Loading features...</span>
+</div>
+
+<!-- MAIN LAYOUT -->
+<div class="main-layout">
+
+  <!-- FILE TREE -->
+  <aside class="sidebar" id="sidebar">
+    <div class="sidebar-header">
+      <span class="sidebar-title">EXPLORER</span>
+      <div class="sidebar-actions">
+        <button class="icon-btn" id="btnRefreshTree">↻</button>
+      </div>
+    </div>
+    <div class="workspace-label" id="workspaceLabel">No workspace</div>
+    <div class="file-tree" id="fileTree"><div class="empty-state">Open a folder to start</div></div>
+  </aside>
+
+  <div class="resize-handle" id="sidebarResize"></div>
+
+  <!-- EDITOR -->
+  <main class="editor-area">
+    <div class="tab-bar" id="tabBar"><div class="no-tabs">Open a file to start editing</div></div>
+    <div id="monacoEditor" class="monaco-container"></div>
+    <div class="terminal-panel" id="terminalPanel">
+      <div class="terminal-header">
+        <span>TERMINAL</span>
+        <div style="display:flex;gap:6px;align-items:center">
+          <button class="icon-btn" id="btnNewTerminal">+</button>
+          <button class="icon-btn" id="btnToggleTerminal">⌄</button>
+        </div>
+      </div>
+      <div id="terminalContainer" class="terminal-container"></div>
+    </div>
+  </main>
+
+  <div class="resize-handle horizontal" id="chatResize"></div>
+
+  <!-- AI CHAT PANEL -->
+  <aside class="chat-panel" id="chatPanel">
+    <div class="chat-header">
+      <span class="chat-title">AI ASSISTANT</span>
+      <button class="icon-btn" id="btnClearChat">✕</button>
+    </div>
+    <div class="chat-context">
+      <label class="context-toggle">
+        <input type="checkbox" id="chkSendFile" checked>
+        <span>Send current file</span>
+      </label>
+    </div>
+    <div class="chat-messages" id="chatMessages">
+      <div class="ai-welcome">
+        <div class="welcome-icon">✦</div>
+        <div class="welcome-text">
+          <strong>Hey! Your AI coding assistant is ready.</strong>
+          <p>Use the feature bar above to enable <b>RAG</b> (search your codebase), <b>Web Research</b>, or switch to <b>Agent Team</b> mode for complex tasks.</p>
+        </div>
+      </div>
+    </div>
+    <div class="chat-input-area">
+      <div class="chat-input-wrapper">
+        <textarea id="chatInput" placeholder="Ask anything... ⌘↵ to send" rows="1"></textarea>
+        <button id="btnSend" class="send-btn">
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor"><path d="M2 21L23 12 2 3v7l15 2-15 2v7z"/></svg>
+        </button>
+      </div>
+      <div class="chat-hints">
+        <span>⌘↵ to send</span>
+        <span id="activeModelLabel">◆ Claude</span>
+      </div>
+    </div>
+  </aside>
+
+  <!-- AGENT PANEL (hidden by default) -->
+  <aside class="chat-panel agent-panel hidden" id="agentPanel">
+    <!-- Rendered by features.js -->
+  </aside>
+
+</div>
+
+<!-- PANEL OVERLAY (Memory, Indexing) -->
+<div class="modal-overlay" id="panelOverlay" style="display:none">
+  <div class="modal large-modal" id="panelContent"></div>
+</div>
+
+<!-- MODAL (file/folder input) -->
+<div class="modal-overlay" id="modalOverlay" style="display:none">
+  <div class="modal" id="modal">
+    <div class="modal-title" id="modalTitle">Open Folder</div>
+    <input class="modal-input" id="modalInput" type="text" placeholder="Enter path...">
+    <div class="modal-actions">
+      <button class="btn-ghost" id="modalCancel">Cancel</button>
+      <button class="btn-primary" id="modalConfirm">Confirm</button>
+    </div>
+  </div>
+</div>
+
+<!-- NOTIFICATION -->
+<div class="notification" id="notification"></div>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/monaco-editor/0.44.0/min/vs/loader.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/xterm/5.3.0/xterm.min.js"></script>
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/xterm/5.3.0/xterm.min.css">
+<script src="js/app.js"></script>
+<script src="js/features.js"></script>
+
+</body>
+</html>

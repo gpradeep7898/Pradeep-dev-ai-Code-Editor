@@ -1,709 +1,741 @@
-// ─── MyIDE Frontend App ───────────────────────────────────────────────────────
+/* ═══════════════════════════════════════════════════════════════════════════
+   MyIDE v3 — app.js
+   Monaco editor · file tree · tabs · terminal · AI chat
+   ═══════════════════════════════════════════════════════════════════════════ */
 
-const API = '';
-let editor = null;
-let activeModel = 'claude';
-let chatHistory = [];
-let openTabs = []; // [{path, name, unsaved}]
-let activeTabPath = null;
-let terminal = null;
-let ws = null;
-let isAISending = false;
+// ── State ─────────────────────────────────────────────────────────────────────
+const state = {
+  activeModel:  'ollama',
+  ollamaModel:  'qwen2.5-coder:7b',
+  tabs:         new Map(),   // path → { model, savedContent }
+  activeTab:    null,
+  chatHistory:  [],
+  streaming:    false,
+  wsFolder:     null,        // current workspace folder
+};
 
-// ─── INIT ─────────────────────────────────────────────────────────────────────
-document.addEventListener('DOMContentLoaded', () => {
-  initMonaco();
-  initWebSocket();
-  initModelSwitcher();
-  initChatInput();
-  initToolbarButtons();
-  initResizeHandles();
-  loadWorkspace();
-  // Init features after a short tick so features.js is fully parsed
-  setTimeout(() => { if (typeof featuresInit === 'function') featuresInit(); }, 100);
-});
+let monacoEditor = null;
+let termInstance = null, fitAddon = null, termWS = null;
 
-// ─── MONACO EDITOR ────────────────────────────────────────────────────────────
+// ── Language map ──────────────────────────────────────────────────────────────
+const LANG = {
+  js:'javascript', mjs:'javascript', cjs:'javascript',
+  ts:'typescript', tsx:'typescript', jsx:'javascript',
+  py:'python', rb:'ruby', go:'go', rs:'rust', java:'java',
+  cpp:'cpp', cc:'cpp', c:'c', cs:'csharp', php:'php',
+  html:'html', htm:'html', vue:'html', svelte:'html',
+  css:'css', scss:'scss', less:'less',
+  json:'json', jsonc:'json',
+  md:'markdown', markdown:'markdown',
+  sh:'shell', bash:'shell', zsh:'shell',
+  yaml:'yaml', yml:'yaml', xml:'xml', sql:'sql',
+  swift:'swift', kt:'kotlin', r:'r', lua:'lua',
+  dockerfile:'dockerfile',
+};
+function getLang(ext) { return LANG[ext] || 'plaintext'; }
+
+// ── Utility ───────────────────────────────────────────────────────────────────
+function $(id) { return document.getElementById(id); }
+
+let toastTimer;
+function toast(msg, type = 'info', ms = 2200) {
+  const el = $('toast');
+  el.textContent = msg;
+  el.className = `show ${type}`;
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => { el.className = ''; }, ms);
+}
+
+function basename(p) { return p.split('/').pop(); }
+
+// ── Monaco init ───────────────────────────────────────────────────────────────
 function initMonaco() {
-  require.config({ paths: { vs: 'https://cdnjs.cloudflare.com/ajax/libs/monaco-editor/0.44.0/min/vs' } });
-  require(['vs/editor/editor.main'], () => {
-    // Dark theme matching our IDE
-    monaco.editor.defineTheme('myide-dark', {
-      base: 'vs-dark',
-      inherit: true,
-      rules: [
-        { token: 'comment', foreground: '4a5068', fontStyle: 'italic' },
-        { token: 'keyword', foreground: '7c6ff7' },
-        { token: 'string', foreground: '98c379' },
-        { token: 'number', foreground: 'e87c5a' },
-        { token: 'type', foreground: '61afef' },
-        { token: 'function', foreground: 'd4b4ff' },
-      ],
-      colors: {
-        'editor.background': '#0d0e11',
-        'editor.foreground': '#e8eaf0',
-        'editorLineNumber.foreground': '#2d3344',
-        'editorLineNumber.activeForeground': '#7c6ff7',
-        'editor.selectionBackground': '#252a38',
-        'editor.lineHighlightBackground': '#13151a',
-        'editorCursor.foreground': '#7c6ff7',
-        'editor.findMatchBackground': '#7c6ff730',
-        'editorGutter.background': '#0d0e11',
-        'scrollbar.shadow': '#00000000',
-        'scrollbarSlider.background': '#21252e80',
-        'scrollbarSlider.hoverBackground': '#2d334480',
-      }
-    });
-
-    editor = monaco.editor.create(document.getElementById('monacoEditor'), {
-      theme: 'myide-dark',
-      language: 'plaintext',
-      fontSize: 13,
-      fontFamily: "'JetBrains Mono', 'Fira Code', monospace",
-      fontLigatures: true,
-      lineHeight: 22,
-      letterSpacing: 0.3,
-      minimap: { enabled: true, scale: 1 },
-      scrollBeyondLastLine: false,
-      renderLineHighlight: 'line',
-      cursorBlinking: 'smooth',
-      cursorSmoothCaretAnimation: 'on',
-      smoothScrolling: true,
-      padding: { top: 16 },
-      automaticLayout: true,
-      tabSize: 2,
-      wordWrap: 'off',
-      renderWhitespace: 'selection',
-      bracketPairColorization: { enabled: true },
-      suggest: { showStatusBar: true },
-    });
-
-    // Mark file as unsaved on change
-    editor.onDidChangeModelContent(() => {
-      if (activeTabPath) markTabUnsaved(activeTabPath);
-    });
-
-    // Save on Cmd+S
-    editor.addCommand(monaco.KeyMod.CtrlCmd | monaco.KeyCode.KeyS, saveCurrentFile);
-  });
-}
-
-function getLanguage(ext) {
-  const map = {
-    js: 'javascript', jsx: 'javascript', ts: 'typescript', tsx: 'typescript',
-    py: 'python', html: 'html', css: 'css', scss: 'scss',
-    json: 'json', md: 'markdown', sh: 'shell', bash: 'shell',
-    yaml: 'yaml', yml: 'yaml', xml: 'xml', sql: 'sql',
-    rs: 'rust', go: 'go', rb: 'ruby', php: 'php', java: 'java',
-    c: 'c', cpp: 'cpp', cs: 'csharp', swift: 'swift', kt: 'kotlin',
-    vue: 'html', svelte: 'html', env: 'plaintext', gitignore: 'plaintext',
-  };
-  return map[ext] || 'plaintext';
-}
-
-// ─── TABS ─────────────────────────────────────────────────────────────────────
-function openFileInEditor(filePath) {
-  fetch(`${API}/api/file?path=${encodeURIComponent(filePath)}`)
-    .then(r => r.json())
-    .then(data => {
-      if (data.error) { notify(data.error, 'error'); return; }
-
-      const name = filePath.split('/').pop();
-      const ext = name.includes('.') ? name.split('.').pop() : '';
-
-      // Add tab if not already open
-      if (!openTabs.find(t => t.path === filePath)) {
-        openTabs.push({ path: filePath, name, unsaved: false });
-      }
-
-      // Switch to this tab
-      setActiveTab(filePath);
-
-      // Set editor content
-      const model = monaco.editor.createModel(data.content, getLanguage(ext));
-      editor.setModel(model);
-
-      // Update filepath in topbar
-      document.getElementById('currentFilePath').textContent = filePath;
-
-      // Highlight in tree
-      document.querySelectorAll('.tree-item').forEach(el => {
-        el.classList.toggle('active', el.dataset.path === filePath);
+  return new Promise(resolve => {
+    require.config({ paths: { vs: 'https://cdnjs.cloudflare.com/ajax/libs/monaco-editor/0.44.0/min/vs' } });
+    require(['vs/editor/editor.main'], () => {
+      // Custom theme
+      monaco.editor.defineTheme('myide-dark', {
+        base: 'vs-dark',
+        inherit: true,
+        rules: [
+          { token: 'comment', foreground: '5a5a7a', fontStyle: 'italic' },
+          { token: 'string',  foreground: 'a8d5a2' },
+          { token: 'keyword', foreground: 'a89ef9' },
+          { token: 'number',  foreground: 'f0db4f' },
+        ],
+        colors: {
+          'editor.background':           '#0d0e11',
+          'editor.foreground':           '#e4e4ef',
+          'editor.lineHighlightBackground': '#1a1b22',
+          'editorLineNumber.foreground': '#3a3a5a',
+          'editorLineNumber.activeForeground': '#7c6ff7',
+          'editor.selectionBackground':  '#3d387555',
+          'editorCursor.foreground':     '#7c6ff7',
+          'editorIndentGuide.background': '#22232e',
+          'editorIndentGuide.activeBackground': '#3d3875',
+        },
       });
 
-      renderTabs();
+      monacoEditor = monaco.editor.create($('monaco-editor'), {
+        theme:              'myide-dark',
+        fontSize:           14,
+        fontFamily:         "'JetBrains Mono', 'Menlo', monospace",
+        fontLigatures:      true,
+        lineHeight:         22,
+        minimap:            { enabled: false },
+        scrollBeyondLastLine: false,
+        renderWhitespace:   'none',
+        smoothScrolling:    true,
+        cursorBlinking:     'phase',
+        cursorSmoothCaretAnimation: 'on',
+        padding:            { top: 12 },
+        automaticLayout:    true,
+        bracketPairColorization: { enabled: true },
+        suggest:            { showWords: true },
+      });
+
+      // Cmd+S to save
+      monacoEditor.addCommand(monaco.KeyMod.CtrlCmd | monaco.KeyCode.KeyS, saveCurrentFile);
+
+      // Track dirty state
+      monacoEditor.onDidChangeModelContent(() => {
+        if (!state.activeTab) return;
+        const tab = state.tabs.get(state.activeTab);
+        if (!tab) return;
+        const isDirty = monacoEditor.getValue() !== tab.savedContent;
+        const tabEl = document.querySelector(`.tab[data-path="${CSS.escape(state.activeTab)}"]`);
+        if (tabEl) tabEl.classList.toggle('dirty', isDirty);
+      });
+
+      resolve();
     });
+  });
 }
 
-function setActiveTab(filePath) {
-  activeTabPath = filePath;
-  renderTabs();
-}
-
+// ── Tabs ──────────────────────────────────────────────────────────────────────
 function renderTabs() {
-  const bar = document.getElementById('tabBar');
-  if (openTabs.length === 0) {
-    bar.innerHTML = '<div class="no-tabs">Open a file to start editing</div>';
-    return;
+  const list = $('tab-list');
+  list.innerHTML = '';
+  for (const [p, tab] of state.tabs) {
+    const el = document.createElement('div');
+    el.className = 'tab' + (p === state.activeTab ? ' active' : '');
+    el.dataset.path = p;
+    const isDirty = monacoEditor && tab.model === monacoEditor.getModel()
+      ? monacoEditor.getValue() !== tab.savedContent
+      : false;
+    if (isDirty) el.classList.add('dirty');
+    el.innerHTML = `<span class="tab-name">${basename(p)}</span><button class="tab-x" title="Close">✕</button>`;
+    el.addEventListener('click', e => {
+      if (!e.target.classList.contains('tab-x')) switchTab(p);
+    });
+    el.querySelector('.tab-x').addEventListener('click', e => { e.stopPropagation(); closeTab(p); });
+    list.appendChild(el);
   }
-
-  bar.innerHTML = openTabs.map(tab => `
-    <div class="tab ${tab.path === activeTabPath ? 'active' : ''} ${tab.unsaved ? 'unsaved' : ''}" 
-         data-path="${tab.path}" onclick="switchTab('${tab.path}')">
-      <span>${tab.name}</span>
-      <span class="tab-close" onclick="closeTab(event, '${tab.path}')">×</span>
-    </div>
-  `).join('');
+  // Update filepath in titlebar
+  $('active-file-path').textContent = state.activeTab || 'No file open';
 }
 
-window.switchTab = function(filePath) {
-  openFileInEditor(filePath);
-};
+async function openFile(filePath) {
+  if (state.tabs.has(filePath)) { switchTab(filePath); return; }
+  try {
+    const r = await fetch(`/api/file?path=${encodeURIComponent(filePath)}`);
+    const data = await r.json();
+    if (data.error) { toast(data.error, 'error'); return; }
+    const ext   = filePath.split('.').pop().toLowerCase();
+    const lang  = getLang(ext);
+    const model = monaco.editor.createModel(data.content, lang, monaco.Uri.file(filePath));
+    state.tabs.set(filePath, { model, savedContent: data.content });
+    switchTab(filePath);
+  } catch (e) { toast(`Cannot open file: ${e.message}`, 'error'); }
+}
 
-window.closeTab = function(e, filePath) {
-  e.stopPropagation();
-  openTabs = openTabs.filter(t => t.path !== filePath);
-  if (activeTabPath === filePath) {
-    activeTabPath = openTabs[openTabs.length - 1]?.path || null;
-    if (activeTabPath) openFileInEditor(activeTabPath);
-    else {
-      editor?.setModel(monaco.editor.createModel('', 'plaintext'));
-      document.getElementById('currentFilePath').textContent = 'No file open';
+function switchTab(filePath) {
+  state.activeTab = filePath;
+  const tab = state.tabs.get(filePath);
+  if (tab && monacoEditor) {
+    monacoEditor.setModel(tab.model);
+    monacoEditor.focus();
+  }
+  $('editor-placeholder').classList.add('hidden');
+  renderTabs();
+  // Sync tree selection
+  document.querySelectorAll('.tree-item.sel').forEach(el => el.classList.remove('sel'));
+  const treeEl = document.querySelector(`.tree-item[data-path="${CSS.escape(filePath)}"]`);
+  if (treeEl) { treeEl.classList.add('sel'); treeEl.scrollIntoView({ block: 'nearest' }); }
+}
+
+function closeTab(filePath) {
+  const tab = state.tabs.get(filePath);
+  if (tab?.model) tab.model.dispose();
+  state.tabs.delete(filePath);
+  if (state.activeTab === filePath) {
+    const remaining = [...state.tabs.keys()];
+    state.activeTab = remaining[remaining.length - 1] ?? null;
+    if (state.activeTab) {
+      monacoEditor.setModel(state.tabs.get(state.activeTab).model);
+    } else {
+      monacoEditor.setModel(null);
+      $('editor-placeholder').classList.remove('hidden');
     }
   }
   renderTabs();
+}
+
+async function saveCurrentFile() {
+  if (!state.activeTab || !monacoEditor) return;
+  const content = monacoEditor.getValue();
+  try {
+    const r = await fetch('/api/file', {
+      method:  'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body:    JSON.stringify({ path: state.activeTab, content }),
+    });
+    const data = await r.json();
+    if (data.ok) {
+      state.tabs.get(state.activeTab).savedContent = content;
+      renderTabs();
+      toast('Saved', 'success');
+    } else { toast(data.error, 'error'); }
+  } catch (e) { toast(`Save failed: ${e.message}`, 'error'); }
+}
+
+// ── File Tree ─────────────────────────────────────────────────────────────────
+async function loadTree(dirPath, container) {
+  try {
+    const r    = await fetch(`/api/files?path=${encodeURIComponent(dirPath)}`);
+    const data = await r.json();
+    if (data.error) { container.innerHTML = `<div class="tree-empty">${data.error}</div>`; return; }
+
+    container.innerHTML = '';
+    for (const item of data.items) {
+      const el = document.createElement('div');
+      el.className = `tree-item ${item.isDirectory ? 'folder' : 'file'}`;
+      el.dataset.path = item.path;
+      if (item.ext) el.dataset.ext = item.ext;
+      el.innerHTML = `<span class="tree-icon">${item.isDirectory ? '▶' : fileIcon(item.ext)}</span><span class="tree-name">${item.name}</span>`;
+
+      if (item.isDirectory) {
+        el.addEventListener('click', async e => {
+          e.stopPropagation();
+          const open = el.classList.toggle('open');
+          el.querySelector('.tree-icon').textContent = open ? '▼' : '▶';
+          let child = el.nextElementSibling;
+          if (open) {
+            if (!child || !child.classList.contains('tree-children')) {
+              child = document.createElement('div');
+              child.className = 'tree-children';
+              el.after(child);
+            }
+            await loadTree(item.path, child);
+          } else {
+            if (child?.classList.contains('tree-children')) child.remove();
+          }
+        });
+      } else {
+        el.addEventListener('click', () => openFile(item.path));
+      }
+      container.appendChild(el);
+    }
+  } catch (e) { container.innerHTML = `<div class="tree-empty">Error: ${e.message}</div>`; }
+}
+
+function fileIcon(ext) {
+  const icons = { js:'JS', ts:'TS', py:'PY', json:'{}', md:'MD', html:'HT', css:'CS',
+                  sh:'SH', go:'GO', rs:'RS', cpp:'C+', java:'JV', kt:'KT', swift:'SW' };
+  return icons[ext] || '·';
+}
+
+async function openFolder(folderPath) {
+  folderPath = folderPath.replace(/^~/, () => { /* server handles ~ */ return '~'; });
+  const treeEl   = $('file-tree');
+  const wsPathEl = $('ws-path');
+  treeEl.innerHTML = '<div class="tree-empty">Loading…</div>';
+  state.wsFolder = folderPath;
+  wsPathEl.textContent = folderPath;
+  wsPathEl.title = folderPath;
+  await loadTree(folderPath, treeEl);
+  // Persist to localStorage
+  localStorage.setItem('myide_workspace', folderPath);
+}
+
+// ── Terminal ──────────────────────────────────────────────────────────────────
+function initTerminal() {
+  if (termInstance) return;
+  termInstance = new Terminal({
+    fontFamily:   "'JetBrains Mono', 'Menlo', monospace",
+    fontSize:     13,
+    theme: {
+      background:  '#0d0e11',
+      foreground:  '#e4e4ef',
+      cursor:      '#7c6ff7',
+      black:       '#1a1b22',
+      brightBlack: '#5a5a7a',
+      blue:        '#7c6ff7',
+      green:       '#4ade80',
+      yellow:      '#facc15',
+      red:         '#f87171',
+      cyan:        '#79d4fd',
+      white:       '#e4e4ef',
+    },
+    cursorBlink: true,
+    allowTransparency: true,
+    scrollback: 5000,
+  });
+  fitAddon = new FitAddon.FitAddon();
+  termInstance.loadAddon(fitAddon);
+  termInstance.open($('terminal-container'));
+  fitAddon.fit();
+
+  connectTermWS();
+
+  termInstance.onData(data => {
+    if (termWS?.readyState === WebSocket.OPEN) {
+      termWS.send(JSON.stringify({ type: 'input', data }));
+    }
+  });
+
+  window.addEventListener('resize', () => { if (fitAddon) fitAddon.fit(); });
+}
+
+function connectTermWS() {
+  const proto = location.protocol === 'https:' ? 'wss' : 'ws';
+  termWS = new WebSocket(`${proto}://${location.host}/terminal`);
+  termWS.onopen    = () => {
+    const { cols, rows } = termInstance;
+    termWS.send(JSON.stringify({ type: 'resize', cols, rows }));
+  };
+  termWS.onmessage = e => {
+    try {
+      const { type, data } = JSON.parse(e.data);
+      if (type === 'output') termInstance.write(data);
+    } catch { termInstance.write(e.data); }
+  };
+  termWS.onclose   = () => termInstance.writeln('\r\n\x1b[33m[connection closed]\x1b[0m');
+  termWS.onerror   = () => termInstance.writeln('\r\n\x1b[31m[WebSocket error]\x1b[0m');
+
+  // Send resize on terminal resize
+  termInstance.onResize(({ cols, rows }) => {
+    if (termWS?.readyState === WebSocket.OPEN) {
+      termWS.send(JSON.stringify({ type: 'resize', cols, rows }));
+    }
+  });
+}
+
+function showTerminal() {
+  const panel  = $('terminal-panel');
+  const area   = $('main-area');
+  panel.classList.remove('term-collapsed');
+  area.classList.remove('term-hidden');
+  if (!termInstance) initTerminal();
+  else { setTimeout(() => fitAddon?.fit(), 50); }
+}
+
+function hideTerminal() {
+  $('terminal-panel').classList.add('term-collapsed');
+  $('main-area').classList.add('term-hidden');
+}
+
+// ── Ollama status ─────────────────────────────────────────────────────────────
+async function checkOllama() {
+  const dot   = $('ollama-dot');
+  const label = $('ollama-label');
+  dot.className = 'status-dot loading';
+  try {
+    const r    = await fetch('/api/ollama/status');
+    const data = await r.json();
+    if (data.running) {
+      dot.className   = 'status-dot online';
+      label.textContent = 'Ollama ✓';
+      // Populate model selector
+      if (data.models.length > 0) {
+        const sel = $('ollamaModelSel');
+        const cur = sel.value;
+        sel.innerHTML = '';
+        data.models.forEach(m => {
+          const opt = document.createElement('option');
+          opt.value = opt.textContent = m;
+          sel.appendChild(opt);
+        });
+        // Try to restore selection
+        if ([...sel.options].some(o => o.value === cur)) sel.value = cur;
+        state.ollamaModel = sel.value;
+        $('ollama-sub').textContent = sel.value;
+      }
+    } else {
+      dot.className = 'status-dot offline';
+      label.textContent = 'Ollama ✗';
+    }
+  } catch {
+    dot.className = 'status-dot offline';
+    label.textContent = 'Ollama ✗';
+  }
+}
+
+// ── AI Chat ───────────────────────────────────────────────────────────────────
+function addMsg(role, content, streaming = false) {
+  const box  = $('chat-messages');
+  const div  = document.createElement('div');
+  div.className = `msg ${role}`;
+  div.innerHTML = `<div class="msg-role">${role === 'user' ? 'You' : 'AI'}</div><div class="msg-body${streaming ? ' streaming' : ''}">${escapeHtml(content)}</div>`;
+  box.appendChild(div);
+  box.scrollTop = box.scrollHeight;
+  return div.querySelector('.msg-body');
+}
+
+function escapeHtml(s) {
+  return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+}
+
+function renderMarkdown(bodyEl, rawText) {
+  bodyEl.classList.remove('streaming');
+  // Parse code blocks
+  const html = rawText
+    .replace(/&amp;/g, '&').replace(/&lt;/g, '<').replace(/&gt;/g, '>')  // unescape first
+    .replace(/```(\w*)\n?([\s\S]*?)```/g, (_, lang, code) => {
+      const highlighted = lang && hljs.getLanguage(lang)
+        ? hljs.highlight(code.trim(), { language: lang }).value
+        : hljs.highlightAuto(code.trim()).value;
+      return `<div class="code-block">
+        <div class="code-hdr">
+          <span class="code-lang">${lang || 'code'}</span>
+          <div class="code-acts">
+            <button onclick="codeAction(this,'copy')">Copy</button>
+            <button onclick="codeAction(this,'insert')">Insert</button>
+            <button onclick="codeAction(this,'save')">Save as file</button>
+          </div>
+        </div>
+        <pre><code>${highlighted}</code></pre>
+      </div>`;
+    })
+    .replace(/`([^`]+)`/g, '<code>$1</code>')
+    .replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>')
+    .replace(/\*(.+?)\*/g, '<em>$1</em>')
+    .replace(/^#{1,3} (.+)$/gm, (_, t) => `<h3>${t}</h3>`)
+    .replace(/\n\n/g, '</p><p>')
+    .replace(/\n/g, '<br>');
+  bodyEl.innerHTML = `<p>${html}</p>`;
+}
+
+function getCodeFromEl(btn) {
+  const pre  = btn.closest('.code-block').querySelector('pre code');
+  return pre ? pre.textContent : '';
+}
+
+window.codeAction = function(btn, action) {
+  const code = getCodeFromEl(btn);
+  if (action === 'copy') {
+    navigator.clipboard.writeText(code).then(() => toast('Copied!', 'success'));
+  } else if (action === 'insert') {
+    if (monacoEditor) {
+      const pos = monacoEditor.getPosition();
+      monacoEditor.executeEdits('', [{ range: new monaco.Range(pos.lineNumber, pos.column, pos.lineNumber, pos.column), text: code }]);
+      monacoEditor.focus();
+      toast('Inserted into editor', 'success');
+    } else { toast('No file open', 'error'); }
+  } else if (action === 'save') {
+    const name = prompt('Save as file (path):', (state.wsFolder || '/tmp') + '/snippet.txt');
+    if (!name) return;
+    fetch('/api/file', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ path: name, content: code }) })
+      .then(r => r.json()).then(d => d.ok ? toast('Saved: ' + name, 'success') : toast(d.error, 'error'));
+  }
 };
 
-function markTabUnsaved(filePath) {
-  const tab = openTabs.find(t => t.path === filePath);
-  if (tab && !tab.unsaved) {
-    tab.unsaved = true;
-    renderTabs();
-  }
-}
+async function sendChat(text) {
+  if (!text.trim() || state.streaming) return;
+  text = text.trim();
 
-function markTabSaved(filePath) {
-  const tab = openTabs.find(t => t.path === filePath);
-  if (tab) {
-    tab.unsaved = false;
-    renderTabs();
-  }
-}
+  // Append user message
+  state.chatHistory.push({ role: 'user', content: text });
+  addMsg('user', text);
 
-// ─── SAVE ─────────────────────────────────────────────────────────────────────
-function saveCurrentFile() {
-  if (!activeTabPath || !editor) return;
-  const content = editor.getValue();
-  fetch(`${API}/api/file`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ path: activeTabPath, content })
-  }).then(r => r.json()).then(d => {
-    if (d.ok) {
-      markTabSaved(activeTabPath);
-      notify('Saved ✓', 'success');
-    }
-  });
-}
-
-// ─── FILE TREE ────────────────────────────────────────────────────────────────
-let fileTree = [];
-
-function loadWorkspace(dirPath) {
-  const url = dirPath ? `${API}/api/files?path=${encodeURIComponent(dirPath)}` : `${API}/api/files`;
-  fetch(url).then(r => r.json()).then(data => {
-    fileTree = data.tree;
-    document.getElementById('workspaceLabel').textContent = data.path;
-    renderFileTree(data.tree, document.getElementById('fileTree'), 0);
-  });
-}
-
-function renderFileTree(items, container, depth) {
-  container.innerHTML = '';
-  if (!items || items.length === 0) {
-    container.innerHTML = '<div class="empty-state">Empty folder</div>';
-    return;
+  // File context
+  let fileContext = null, filePath = null;
+  if ($('chkSendFile').checked && state.activeTab && monacoEditor) {
+    fileContext = monacoEditor.getValue();
+    filePath    = state.activeTab;
   }
 
-  items.forEach(item => {
-    const el = document.createElement('div');
-    el.className = 'tree-item';
-    el.dataset.path = item.path;
-    el.style.paddingLeft = `${depth * 12 + 8}px`;
+  // Thinking indicator
+  const thinkEl = document.createElement('div');
+  thinkEl.className = 'thinking';
+  thinkEl.textContent = 'Thinking…';
+  $('chat-messages').appendChild(thinkEl);
+  $('chat-messages').scrollTop = $('chat-messages').scrollHeight;
 
-    const icon = item.type === 'directory' ? '📁' : getFileIcon(item.ext);
-    el.innerHTML = `<span class="icon">${icon}</span><span class="name">${item.name}</span>`;
-
-    if (item.type === 'directory') {
-      let expanded = false;
-      let childContainer = null;
-      el.onclick = () => {
-        expanded = !expanded;
-        el.querySelector('.icon').textContent = expanded ? '📂' : '📁';
-        if (expanded) {
-          childContainer = document.createElement('div');
-          renderFileTree(item.children || [], childContainer, depth + 1);
-          el.insertAdjacentElement('afterend', childContainer);
-        } else {
-          childContainer?.remove();
-          childContainer = null;
-        }
-      };
-    } else {
-      el.onclick = () => openFileInEditor(item.path);
-    }
-
-    container.appendChild(el);
-  });
-}
-
-function getFileIcon(ext) {
-  const icons = {
-    js: '🟨', jsx: '⚛️', ts: '🔷', tsx: '⚛️',
-    py: '🐍', html: '🌐', css: '🎨', scss: '🎨',
-    json: '📋', md: '📝', sh: '💻', yaml: '⚙️', yml: '⚙️',
-    png: '🖼️', jpg: '🖼️', jpeg: '🖼️', gif: '🖼️', svg: '🎭',
-    pdf: '📄', zip: '📦', env: '🔐', gitignore: '🚫',
-    rs: '🦀', go: '🐹', rb: '💎', php: '🐘',
-  };
-  return icons[ext] || '📄';
-}
-
-// ─── WEBSOCKET + TERMINAL ─────────────────────────────────────────────────────
-function initWebSocket() {
-  ws = new WebSocket(`ws://${location.host}`);
-  ws.onopen = () => {
-    document.getElementById('statusDot').className = 'status-dot';
-    // Start file watcher
-    ws.send(JSON.stringify({ type: 'watch:start' }));
-    // Init terminal
-    initTerminal();
-  };
-  ws.onclose = () => {
-    document.getElementById('statusDot').className = 'status-dot error';
-  };
-  ws.onmessage = (event) => {
-    const msg = JSON.parse(event.data);
-    if (msg.type === 'terminal:data' && terminal) {
-      terminal.write(msg.data);
-    }
-    if (msg.type === 'watch:change') {
-      // Refresh file tree on changes
-      loadWorkspace();
-    }
-  };
-}
-
-function initTerminal() {
-  if (typeof Terminal === 'undefined') return;
-
-  terminal = new Terminal({
-    theme: {
-      background: '#0d0e11',
-      foreground: '#e8eaf0',
-      cursor: '#7c6ff7',
-      selection: '#252a38',
-      black: '#21252e',
-      brightBlack: '#4a5068',
-      red: '#e85a5a',
-      green: '#4fa87c',
-      yellow: '#e8c35a',
-      blue: '#7c6ff7',
-      magenta: '#c47cf7',
-      cyan: '#5ac4e8',
-      white: '#e8eaf0',
-    },
-    fontFamily: "'JetBrains Mono', monospace",
-    fontSize: 12,
-    lineHeight: 1.4,
-    cursorBlink: true,
-    cursorStyle: 'bar',
-  });
-
-  terminal.open(document.getElementById('terminalContainer'));
-
-  ws.send(JSON.stringify({ type: 'terminal:start', cols: terminal.cols, rows: terminal.rows }));
-
-  terminal.onData(data => {
-    ws.send(JSON.stringify({ type: 'terminal:input', data }));
-  });
-
-  new ResizeObserver(() => {
-    terminal.fit && terminal.fit();
-  }).observe(document.getElementById('terminalContainer'));
-}
-
-// ─── AI CHAT ──────────────────────────────────────────────────────────────────
-function initChatInput() {
-  const input = document.getElementById('chatInput');
-  const sendBtn = document.getElementById('btnSend');
-
-  const send = () => {
-    if (isAISending) return;
-    const text = input.value.trim();
-    if (!text) return;
-    input.value = '';
-    input.style.height = 'auto';
-    sendMessage(text);
-  };
-
-  sendBtn.addEventListener('click', send);
-  input.addEventListener('keydown', (e) => {
-    if ((e.metaKey || e.ctrlKey) && e.key === 'Enter') {
-      e.preventDefault();
-      send();
-    }
-  });
-
-  // Auto-resize textarea
-  input.addEventListener('input', () => {
-    input.style.height = 'auto';
-    input.style.height = Math.min(input.scrollHeight, 120) + 'px';
-  });
-}
-
-async function sendMessage(text) {
-  isAISending = true;
-  document.getElementById('btnSend').disabled = true;
-
-  // Add user message
-  chatHistory.push({ role: 'user', content: text });
-  appendMessage('user', text);
-
-  // Get file context if checked
-  let fileContext = null;
-  if (document.getElementById('chkSendFile').checked && activeTabPath && editor) {
-    fileContext = `// File: ${activeTabPath}\n${editor.getValue()}`;
-    if (fileContext.length > 12000) fileContext = fileContext.slice(0, 12000) + '\n... (truncated)';
-  }
-
-  // Show typing indicator
-  const typingEl = appendTyping();
+  state.streaming = true;
+  $('btn-send').disabled = true;
 
   try {
-    const flags = typeof featuresGetFlags === 'function' ? featuresGetFlags() : {};
-
-    const response = await fetch(`${API}/api/chat`, {
-      method: 'POST',
+    const resp = await fetch('/api/ai/chat', {
+      method:  'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
-        messages: chatHistory,
-        model: activeModel,
+        messages:    state.chatHistory.slice(-20).filter(m => m.role !== 'system'),
+        model:       state.activeModel,
+        ollamaModel: state.ollamaModel,
         fileContext,
-        useRag: flags.useRag || false,
-        useResearch: flags.useResearch || false,
-      })
+        filePath,
+      }),
     });
 
-    typingEl.remove();
+    thinkEl.remove();
+    const bodyEl = addMsg('ai', '', true);
+    let raw = '';
 
-    let fullText = '';
-    const msgEl = appendMessage('assistant', '');
-    const contentEl = msgEl.querySelector('.message-content');
-
-    const reader = response.body.getReader();
+    const reader  = resp.body.getReader();
     const decoder = new TextDecoder();
+    let   buf     = '';
 
     while (true) {
       const { done, value } = await reader.read();
       if (done) break;
-      const lines = decoder.decode(value).split('\n');
+      buf += decoder.decode(value, { stream: true });
+      const lines = buf.split('\n');
+      buf = lines.pop();
       for (const line of lines) {
         if (!line.startsWith('data: ')) continue;
-        let data;
-        try { data = JSON.parse(line.slice(6)); } catch { continue; }
-
-        if (data.type === 'text' || data.text) {
-          const txt = data.text || data.text;
-          fullText += txt;
-          contentEl.innerHTML = renderMarkdown(fullText);
-          addCodeActions(contentEl);
-          scrollChatToBottom();
-        }
-        if (data.type === 'status' && typeof featuresShowStatus === 'function') {
-          featuresShowStatus(data.message);
-        }
-        if (data.type === 'rag' && typeof featuresShowRag === 'function') {
-          featuresShowRag(data.files);
-        }
-        if (data.type === 'error' || data.error) {
-          contentEl.innerHTML = `<span style="color:#e85a5a">Error: ${data.error}</span>`;
-        }
+        try {
+          const d = JSON.parse(line.slice(6));
+          if (d.token) { raw += d.token; bodyEl.textContent = raw; $('chat-messages').scrollTop = $('chat-messages').scrollHeight; }
+          if (d.error) { bodyEl.textContent = '⚠ ' + d.error; bodyEl.classList.add('msg-error'); }
+          if (d.done)  { renderMarkdown(bodyEl, raw); state.chatHistory.push({ role: 'assistant', content: raw }); }
+        } catch { /* skip */ }
       }
     }
-    if (typeof featuresShowStatus === 'function') featuresShowStatus('');
-
-    chatHistory.push({ role: 'assistant', content: fullText });
-
   } catch (e) {
-    typingEl.remove();
-    appendMessage('assistant', `Error: ${e.message}`);
+    thinkEl.remove();
+    addMsg('ai', '⚠ ' + e.message);
   }
 
-  isAISending = false;
-  document.getElementById('btnSend').disabled = false;
-  document.getElementById('chatInput').focus();
+  state.streaming = false;
+  $('btn-send').disabled = false;
+  $('chat-input').focus();
 }
 
-function appendMessage(role, text) {
-  const msgs = document.getElementById('chatMessages');
-  const label = role === 'user' ? 'YOU' : activeModel === 'claude' ? '◆ CLAUDE' : '⬡ GPT-4O';
-  const div = document.createElement('div');
-  div.className = `message ${role}`;
-  div.innerHTML = `
-    <div class="message-role">${label}</div>
-    <div class="message-content">${role === 'user' ? escapeHtml(text) : renderMarkdown(text)}</div>
-  `;
-  msgs.appendChild(div);
-  scrollChatToBottom();
-  return div;
-}
-
-function appendTyping() {
-  const msgs = document.getElementById('chatMessages');
-  const div = document.createElement('div');
-  div.className = 'message assistant';
-  div.innerHTML = `
-    <div class="message-role">${activeModel === 'claude' ? '◆ CLAUDE' : '⬡ GPT-4O'}</div>
-    <div class="typing-indicator">
-      <div class="typing-dot"></div>
-      <div class="typing-dot"></div>
-      <div class="typing-dot"></div>
-    </div>
-  `;
-  msgs.appendChild(div);
-  scrollChatToBottom();
-  return div;
-}
-
-function scrollChatToBottom() {
-  const msgs = document.getElementById('chatMessages');
-  msgs.scrollTop = msgs.scrollHeight;
-}
-
-function addCodeActions(contentEl) {
-  contentEl.querySelectorAll('pre:not([data-actions])').forEach(pre => {
-    pre.dataset.actions = '1';
-    const code = pre.querySelector('code');
-    if (!code) return;
-
-    const actions = document.createElement('div');
-    actions.className = 'code-actions';
-
-    const copyBtn = document.createElement('button');
-    copyBtn.className = 'code-action-btn';
-    copyBtn.textContent = '📋 Copy';
-    copyBtn.onclick = () => {
-      navigator.clipboard.writeText(code.textContent);
-      copyBtn.textContent = '✓ Copied!';
-      setTimeout(() => copyBtn.textContent = '📋 Copy', 1500);
-    };
-
-    const insertBtn = document.createElement('button');
-    insertBtn.className = 'code-action-btn';
-    insertBtn.textContent = '⬇ Insert into editor';
-    insertBtn.onclick = () => {
-      if (editor) {
-        const selection = editor.getSelection();
-        editor.executeEdits('ai-insert', [{
-          range: selection,
-          text: code.textContent
-        }]);
-        notify('Code inserted!', 'success');
-      }
-    };
-
-    const newFileBtn = document.createElement('button');
-    newFileBtn.className = 'code-action-btn';
-    newFileBtn.textContent = '📄 New file';
-    newFileBtn.onclick = () => createNewFileWithContent(code.textContent);
-
-    actions.append(copyBtn, insertBtn, newFileBtn);
-    pre.insertAdjacentElement('afterend', actions);
-  });
-}
-
-// ─── MARKDOWN RENDERER ───────────────────────────────────────────────────────
-function renderMarkdown(text) {
-  return text
-    .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
-    .replace(/```(\w+)?\n([\s\S]*?)```/g, (_, lang, code) =>
-      `<pre><code class="language-${lang || ''}">${code.trim()}</code></pre>`)
-    .replace(/`([^`]+)`/g, '<code>$1</code>')
-    .replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>')
-    .replace(/\*(.+?)\*/g, '<em>$1</em>')
-    .replace(/^### (.+)$/gm, '<h3>$1</h3>')
-    .replace(/^## (.+)$/gm, '<h2>$1</h2>')
-    .replace(/^# (.+)$/gm, '<h1>$1</h1>')
-    .replace(/^- (.+)$/gm, '<li>$1</li>')
-    .replace(/(<li>.*<\/li>\n?)+/g, s => `<ul>${s}</ul>`)
-    .replace(/\n\n/g, '</p><p>')
-    .replace(/^(?!<[hup]|<li|<pre)(.+)$/gm, '$1')
-    .replace(/\n/g, '<br>');
-}
-
-function escapeHtml(text) {
-  return text.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
-}
-
-// ─── MODEL SWITCHER ───────────────────────────────────────────────────────────
-function initModelSwitcher() {
-  document.querySelectorAll('.model-btn').forEach(btn => {
-    btn.addEventListener('click', () => {
-      document.querySelectorAll('.model-btn').forEach(b => b.classList.remove('active'));
-      btn.classList.add('active');
-      activeModel = btn.dataset.model;
-      document.getElementById('activeModelLabel').textContent =
-        activeModel === 'claude' ? '◆ Claude' : '⬡ GPT-4o';
-    });
-  });
-}
-
-// ─── TOOLBAR BUTTONS ──────────────────────────────────────────────────────────
-function initToolbarButtons() {
-  document.getElementById('btnSave').addEventListener('click', saveCurrentFile);
-  document.getElementById('btnRefreshTree').addEventListener('click', () => loadWorkspace());
-  document.getElementById('btnClearChat').addEventListener('click', () => {
-    chatHistory = [];
-    document.getElementById('chatMessages').innerHTML = '';
-  });
-
-  document.getElementById('btnToggleTerminal').addEventListener('click', () => {
-    document.getElementById('terminalPanel').classList.toggle('collapsed');
-  });
-
-  document.getElementById('btnNewTerminal').addEventListener('click', () => {
-    if (ws) ws.send(JSON.stringify({ type: 'terminal:start', cols: 80, rows: 24 }));
-  });
-
-  // Open folder
-  document.getElementById('btnOpenFolder').addEventListener('click', () => {
-    openModal('Open Folder', '~/projects', (val) => {
-      fetch(`${API}/api/workspace`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ path: val })
-      }).then(r => r.json()).then(d => {
-        if (d.ok) loadWorkspace(d.path);
-        else notify(d.error, 'error');
-      });
-    });
-  });
-
-  // New file
-  document.getElementById('btnNewFile').addEventListener('click', () => {
-    openModal('New File', 'path/to/newfile.js', (val) => {
-      fetch(`${API}/api/file`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ path: val, content: '' })
-      }).then(() => {
-        loadWorkspace();
-        openFileInEditor(val);
-      });
-    });
-  });
-}
-
-function createNewFileWithContent(content) {
-  openModal('Save as new file', 'path/to/filename.js', (val) => {
-    fetch(`${API}/api/file`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ path: val, content })
-    }).then(() => {
-      loadWorkspace();
-      openFileInEditor(val);
-      notify('File created!', 'success');
-    });
-  });
-}
-
-// ─── MODAL ────────────────────────────────────────────────────────────────────
-let modalCallback = null;
-function openModal(title, placeholder, callback) {
-  modalCallback = callback;
-  document.getElementById('modalTitle').textContent = title;
-  document.getElementById('modalInput').placeholder = placeholder;
-  document.getElementById('modalInput').value = '';
-  document.getElementById('modalOverlay').style.display = 'flex';
-  setTimeout(() => document.getElementById('modalInput').focus(), 50);
-}
-
-document.getElementById('modalCancel').addEventListener('click', () => {
-  document.getElementById('modalOverlay').style.display = 'none';
-});
-
-document.getElementById('modalConfirm').addEventListener('click', () => {
-  const val = document.getElementById('modalInput').value.trim();
-  if (val && modalCallback) modalCallback(val);
-  document.getElementById('modalOverlay').style.display = 'none';
-});
-
-document.getElementById('modalInput').addEventListener('keydown', (e) => {
-  if (e.key === 'Enter') document.getElementById('modalConfirm').click();
-  if (e.key === 'Escape') document.getElementById('modalCancel').click();
-});
-
-document.getElementById('modalOverlay').addEventListener('click', (e) => {
-  if (e.target === document.getElementById('modalOverlay'))
-    document.getElementById('modalCancel').click();
-});
-
-// ─── RESIZE HANDLES ───────────────────────────────────────────────────────────
-function initResizeHandles() {
-  // Sidebar resize
-  setupResize('sidebarResize', 'sidebar', 'width', 140, 500);
-  // Chat panel resize
-  setupResize('chatResize', 'chatPanel', 'width', 240, 600, true);
-}
-
-function setupResize(handleId, targetId, prop, min, max, reverse = false) {
-  const handle = document.getElementById(handleId);
-  const target = document.getElementById(targetId);
-  let startX, startSize;
-
-  handle.addEventListener('mousedown', (e) => {
+// ── Resizers (drag to resize panels) ─────────────────────────────────────────
+function makeVResizer(resizerId, getLeft, setLeft) {
+  const el = $(resizerId);
+  let startX, startW;
+  el.addEventListener('mousedown', e => {
     startX = e.clientX;
-    startSize = parseInt(getComputedStyle(target)[prop]);
-    handle.classList.add('dragging');
+    startW = getLeft();
+    el.classList.add('drag');
     document.body.style.cursor = 'col-resize';
     document.body.style.userSelect = 'none';
-
-    const onMove = (e) => {
-      const delta = reverse ? startX - e.clientX : e.clientX - startX;
-      const newSize = Math.min(max, Math.max(min, startSize + delta));
-      target.style[prop] = newSize + 'px';
+    const onMove = e2 => {
+      const delta = e2.clientX - startX;
+      setLeft(Math.max(120, startW + delta));
     };
-
     const onUp = () => {
-      handle.classList.remove('dragging');
+      el.classList.remove('drag');
       document.body.style.cursor = '';
       document.body.style.userSelect = '';
       document.removeEventListener('mousemove', onMove);
       document.removeEventListener('mouseup', onUp);
     };
-
     document.addEventListener('mousemove', onMove);
     document.addEventListener('mouseup', onUp);
   });
 }
 
-// ─── NOTIFICATIONS ────────────────────────────────────────────────────────────
-function notify(msg, type = '') {
-  const el = document.getElementById('notification');
-  el.textContent = msg;
-  el.className = `notification show ${type}`;
-  setTimeout(() => el.classList.remove('show'), 2500);
-}
-
-// ─── INITIAL WORKSPACE LOAD ───────────────────────────────────────────────────
-function loadWorkspace(path) {
-  const url = path ? `${API}/api/files?path=${encodeURIComponent(path)}` : `${API}/api/files`;
-  fetch(url).then(r => r.json()).then(data => {
-    document.getElementById('workspaceLabel').textContent = data.path.replace(
-      /^\/Users\/[^/]+/, '~'
-    );
-    renderFileTree(data.tree, document.getElementById('fileTree'), 0);
+function makeHResizer(resizerId, getBottom, setBottom) {
+  const el = $(resizerId);
+  let startY, startH;
+  el.addEventListener('mousedown', e => {
+    startY = e.clientY;
+    startH = getBottom();
+    el.classList.add('drag');
+    document.body.style.cursor = 'row-resize';
+    document.body.style.userSelect = 'none';
+    const onMove = e2 => {
+      const delta = startY - e2.clientY;
+      setBottom(Math.max(80, Math.min(600, startH + delta)));
+    };
+    const onUp = () => {
+      el.classList.remove('drag');
+      document.body.style.cursor = '';
+      document.body.style.userSelect = '';
+      fitAddon?.fit();
+      document.removeEventListener('mousemove', onMove);
+      document.removeEventListener('mouseup', onUp);
+    };
+    document.addEventListener('mousemove', onMove);
+    document.addEventListener('mouseup', onUp);
   });
 }
+
+function initResizers() {
+  const ws = $('workspace');
+
+  // Left resizer (sidebar width)
+  makeVResizer('res1',
+    () => parseInt(getComputedStyle(ws).getPropertyValue('--swid') || '240'),
+    w  => { ws.style.setProperty('--swid', w + 'px'); }
+  );
+
+  // Right resizer (chat width)
+  makeVResizer('res2',
+    () => parseInt(getComputedStyle(ws).getPropertyValue('--cwid') || '340'),
+    w  => { ws.style.setProperty('--cwid', w + 'px'); }
+  );
+
+  // Terminal height resizer
+  makeHResizer('res-term',
+    () => {
+      const style = getComputedStyle($('workspace'));
+      return parseInt(style.getPropertyValue('--termh') || '220');
+    },
+    h => {
+      $('workspace').style.setProperty('--termh', h + 'px');
+      fitAddon?.fit();
+    }
+  );
+}
+
+// ── Modal helper ──────────────────────────────────────────────────────────────
+function openModal(title, placeholder, defaultVal = '') {
+  return new Promise(resolve => {
+    $('modal-title').textContent = title;
+    $('modal-input').placeholder = placeholder;
+    $('modal-input').value = defaultVal;
+    $('modal-overlay').classList.remove('hidden');
+    $('modal-input').focus();
+    const confirm = async () => {
+      const val = $('modal-input').value.trim();
+      cleanup();
+      resolve(val || null);
+    };
+    const cancel = () => { cleanup(); resolve(null); };
+    const cleanup = () => {
+      $('modal-overlay').classList.add('hidden');
+      $('modal-confirm').removeEventListener('click', confirm);
+      $('modal-cancel').removeEventListener('click', cancel);
+      $('modal-input').removeEventListener('keydown', onKey);
+    };
+    const onKey = e => { if (e.key === 'Enter') confirm(); if (e.key === 'Escape') cancel(); };
+    $('modal-confirm').addEventListener('click', confirm);
+    $('modal-cancel').addEventListener('click', cancel);
+    $('modal-input').addEventListener('keydown', onKey);
+  });
+}
+
+// ── Keyboard shortcuts ────────────────────────────────────────────────────────
+document.addEventListener('keydown', e => {
+  const cmd = e.metaKey || e.ctrlKey;
+  if (cmd && e.key === 's') { e.preventDefault(); saveCurrentFile(); }
+  if (cmd && e.key === 'n') { e.preventDefault(); newFile(); }
+  if (cmd && e.key === 'o') { e.preventDefault(); openFolderDialog(); }
+  if (e.key === '`' && e.ctrlKey) { e.preventDefault(); toggleTerminal(); }
+  if (cmd && e.key === 'w') { e.preventDefault(); if (state.activeTab) closeTab(state.activeTab); }
+});
+
+function toggleTerminal() {
+  const panel = $('terminal-panel');
+  if (panel.classList.contains('term-collapsed')) showTerminal();
+  else hideTerminal();
+}
+
+async function newFile() {
+  const name = await openModal('New File', 'e.g. src/hello.js', (state.wsFolder || '') + '/');
+  if (!name) return;
+  await fetch('/api/file/new', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ path: name }) });
+  // Refresh tree then open
+  if (state.wsFolder) loadTree(state.wsFolder, $('file-tree'));
+  openFile(name);
+}
+
+async function openFolderDialog() {
+  const folder = await openModal('Open Folder', '/Users/you/myproject', localStorage.getItem('myide_workspace') || '');
+  if (folder) openFolder(folder);
+}
+
+// ── Wire up buttons ───────────────────────────────────────────────────────────
+function initButtons() {
+  $('btnOpenFolder').onclick   = openFolderDialog;
+  $('btnNewFile').onclick      = newFile;
+  $('btnSave').onclick         = saveCurrentFile;
+  $('btnRefreshTree').onclick  = () => { if (state.wsFolder) loadTree(state.wsFolder, $('file-tree')); };
+  $('btnToggleTerm').onclick   = toggleTerminal;
+  $('btnNewTerm').onclick      = () => { if (termInstance) termInstance.focus(); else initTerminal(); };
+  $('btnHideTerm').onclick     = hideTerminal;
+  $('btnClearChat').onclick    = () => {
+    $('chat-messages').innerHTML = '<div class="chat-welcome"><div class="wl-logo">✦</div><p>Chat cleared.</p></div>';
+    state.chatHistory = [];
+  };
+
+  // Model switcher
+  document.querySelectorAll('.model-btn').forEach(btn => {
+    btn.addEventListener('click', () => {
+      document.querySelectorAll('.model-btn').forEach(b => b.classList.remove('active'));
+      btn.classList.add('active');
+      state.activeModel = btn.dataset.model;
+      // Show/hide ollama model row
+      $('ollama-model-row').classList.toggle('hidden', state.activeModel !== 'ollama');
+      // Update footer label
+      const icons = { ollama: '⚡ Ollama', claude: '◆ Claude', gpt: '⬡ GPT-4o' };
+      $('active-model-lbl').textContent = icons[state.activeModel] || state.activeModel;
+    });
+  });
+
+  // Ollama model selector
+  $('ollamaModelSel').addEventListener('change', e => {
+    state.ollamaModel = e.target.value;
+    $('ollama-sub').textContent = e.target.value;
+  });
+
+  // Chat send
+  $('btn-send').onclick = () => {
+    const val = $('chat-input').value;
+    $('chat-input').value = '';
+    autoResizeTextarea($('chat-input'));
+    sendChat(val);
+  };
+
+  $('chat-input').addEventListener('keydown', e => {
+    if ((e.metaKey || e.ctrlKey) && e.key === 'Enter') {
+      e.preventDefault();
+      const val = $('chat-input').value;
+      $('chat-input').value = '';
+      autoResizeTextarea($('chat-input'));
+      sendChat(val);
+    }
+    // Shift+Enter = newline (default)
+  });
+
+  $('chat-input').addEventListener('input', () => autoResizeTextarea($('chat-input')));
+}
+
+function autoResizeTextarea(el) {
+  el.style.height = 'auto';
+  el.style.height = Math.min(el.scrollHeight, 140) + 'px';
+}
+
+// ── Electron IPC (if running inside Electron) ─────────────────────────────────
+function initElectronIPC() {
+  if (!window.electronAPI) return;
+  // Handle folder dropped on dock icon or opened via IPC
+  window.electronAPI.onOpenFolder(folder => openFolder(folder));
+}
+
+// ── Bootstrap ─────────────────────────────────────────────────────────────────
+async function init() {
+  await initMonaco();
+  initButtons();
+  initResizers();
+  initElectronIPC();
+
+  // Restore last workspace
+  const lastWs = localStorage.getItem('myide_workspace');
+  if (lastWs) openFolder(lastWs);
+
+  // Poll Ollama status every 8 seconds
+  checkOllama();
+  setInterval(checkOllama, 8000);
+
+  // Auto-grow chat input
+  autoResizeTextarea($('chat-input'));
+
+  $('main-area').classList.add('term-hidden');
+}
+
+init();

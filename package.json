@@ -1,22 +1,41 @@
 {
   "name": "myide",
-  "version": "2.0.0",
-  "description": "MyIDE v2 — AI-Powered Code Editor with RAG, Memory, Agents & Research",
-  "main": "server/index.js",
+  "version": "3.0.0",
+  "description": "MyIDE v3 — Fast local AI IDE powered by Ollama",
+  "main": "electron/main.js",
   "scripts": {
-    "start": "node server/index.js",
-    "dev": "nodemon server/index.js"
+    "start":    "node server/index.js",
+    "dev":      "nodemon server/index.js",
+    "electron": "electron electron/main.js",
+    "build":    "electron-builder build --mac",
+    "dist":     "npm run build"
+  },
+  "build": {
+    "appId": "com.pradeep.myide",
+    "productName": "MyIDE",
+    "mac": {
+      "category": "public.app-category.developer-tools",
+      "target": ["dmg", "zip"],
+      "arch": ["arm64"],
+      "icon": "assets/icon.icns"
+    },
+    "files": ["server/**", "public/**", "electron/**", "package.json", ".env.example"],
+    "extraResources": [".env.example"]
   },
   "dependencies": {
-    "@anthropic-ai/sdk": "^0.24.0",
-    "chokidar": "^3.6.0",
-    "dotenv": "^16.4.5",
-    "express": "^4.19.2",
-    "openai": "^4.52.0",
-    "ws": "^8.18.0"
+    "@anthropic-ai/sdk": "^0.36.0",
+    "chokidar":          "^3.6.0",
+    "dotenv":            "^16.4.5",
+    "express":           "^4.21.0",
+    "node-pty":          "^1.0.0",
+    "openai":            "^4.67.0",
+    "ws":                "^8.18.0"
   },
   "devDependencies": {
-    "nodemon": "^3.1.4"
+    "electron":         "^33.0.0",
+    "electron-builder": "^25.0.0",
+    "nodemon":          "^3.1.4",
+    "wait-on":          "^8.0.0"
   },
   "engines": {
     "node": ">=18.0.0"

@@ -1,186 +1,243 @@
 require('dotenv').config();
-const express = require('express');
-const http = require('http');
+
+const express   = require('express');
+const http      = require('http');
 const WebSocket = require('ws');
-const path = require('path');
-const fs = require('fs');
-const os = require('os');
-const { exec } = require('child_process');
-const chokidar = require('chokidar');
-const Anthropic = require('@anthropic-ai/sdk');
-const OpenAI = require('openai');
+const path      = require('path');
+const fs        = require('fs');
+const os        = require('os');
 
-const rag = require('./modules/rag');
-const memory = require('./modules/memory');
-const agents = require('./modules/agents');
-const research = require('./modules/research');
-
-const app = express();
+const app    = express();
 const server = http.createServer(app);
-const wss = new WebSocket.Server({ server });
+const wss    = new WebSocket.Server({ noServer: true });
 
 app.use(express.json({ limit: '10mb' }));
 app.use(express.static(path.join(__dirname, '../public')));
 
-const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
-const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
-
-rag.init(openai);
-memory.init(anthropic);
-
-let currentWorkspace = process.env.DEFAULT_WORKSPACE
-  ? process.env.DEFAULT_WORKSPACE.replace('~', os.homedir())
-  : os.homedir();
-
-function buildFileTree(dirPath, depth = 0) {
-  if (depth > 5) return [];
-  try {
-    const items = fs.readdirSync(dirPath, { withFileTypes: true });
-    return items
-      .filter(item => !item.name.startsWith('.') && item.name !== 'node_modules' && item.name !== '__pycache__')
-      .map(item => {
-        const fullPath = path.join(dirPath, item.name);
-        const isDir = item.isDirectory();
-        return { name: item.name, path: fullPath, type: isDir ? 'directory' : 'file', ext: isDir ? null : path.extname(item.name).slice(1), children: isDir ? buildFileTree(fullPath, depth + 1) : null };
-      })
-      .sort((a, b) => { if (a.type !== b.type) return a.type === 'directory' ? -1 : 1; return a.name.localeCompare(b.name); });
-  } catch { return []; }
+// ── helpers ──────────────────────────────────────────────────────────────────
+function sse(res, data) { res.write(`data: ${JSON.stringify(data)}\n\n`); }
+function sseInit(res) {
+  res.setHeader('Content-Type',  'text/event-stream');
+  res.setHeader('Cache-Control', 'no-cache');
+  res.setHeader('Connection',    'keep-alive');
+  res.flushHeaders();
 }
 
-app.get('/api/files', (req, res) => { const dirPath = req.query.path || currentWorkspace; res.json({ path: dirPath, tree: buildFileTree(dirPath) }); });
-app.get('/api/file', (req, res) => { try { res.json({ content: fs.readFileSync(req.query.path, 'utf8') }); } catch (e) { res.status(400).json({ error: e.message }); } });
-app.post('/api/file', (req, res) => { try { const { path: fp, content } = req.body; fs.mkdirSync(path.dirname(fp), { recursive: true }); fs.writeFileSync(fp, content, 'utf8'); res.json({ ok: true }); } catch (e) { res.status(400).json({ error: e.message }); } });
-app.delete('/api/file', (req, res) => { try { const fp = req.query.path; const s = fs.statSync(fp); if (s.isDirectory()) fs.rmSync(fp, { recursive: true }); else fs.unlinkSync(fp); res.json({ ok: true }); } catch (e) { res.status(400).json({ error: e.message }); } });
-app.post('/api/workspace', (req, res) => { const expanded = req.body.path.replace('~', os.homedir()); if (fs.existsSync(expanded)) { currentWorkspace = expanded; res.json({ ok: true, path: currentWorkspace }); } else { res.status(400).json({ error: 'Path does not exist' }); } });
-app.get('/api/workspace', (req, res) => res.json({ path: currentWorkspace }));
-app.post('/api/run', (req, res) => { exec(req.body.command, { cwd: req.body.cwd || currentWorkspace, timeout: 30000 }, (err, stdout, stderr) => res.json({ stdout, stderr, error: err?.message })); });
-
-// ─── Standard AI Chat with all features ──────────────────────────────────────
-app.post('/api/chat', async (req, res) => {
-  const { messages, model, fileContext, useRag, useResearch } = req.body;
-  const lastUserMessage = messages[messages.length - 1]?.content || '';
-
-  res.setHeader('Content-Type', 'text/event-stream');
-  res.setHeader('Cache-Control', 'no-cache');
-  res.setHeader('Connection', 'keep-alive');
-  const send = (data) => res.write(`data: ${JSON.stringify(data)}\n\n`);
-
+// ── file system ───────────────────────────────────────────────────────────────
+app.get('/api/files', (req, res) => {
+  const dir = req.query.path || os.homedir();
   try {
-    let ragContext = '';
-    if (useRag && rag.getStatus().indexed) {
-      send({ type: 'status', message: '🔍 Searching your codebase...' });
-      const results = await rag.search(lastUserMessage, 5);
-      ragContext = rag.formatContext(results);
-      if (results.length > 0) send({ type: 'rag', files: results.map(r => ({ path: r.chunk.filePath, score: r.score })) });
-    }
+    const skip = new Set(['node_modules', '__pycache__', '.git', '.DS_Store']);
+    const items = fs.readdirSync(dir, { withFileTypes: true })
+      .filter(i => !i.name.startsWith('.') && !skip.has(i.name))
+      .map(i => ({
+        name: i.name,
+        path: path.join(dir, i.name),
+        isDirectory: i.isDirectory(),
+        ext:  i.isDirectory() ? null : path.extname(i.name).slice(1).toLowerCase(),
+      }))
+      .sort((a, b) => {
+        if (a.isDirectory !== b.isDirectory) return a.isDirectory ? -1 : 1;
+        return a.name.localeCompare(b.name);
+      });
+    res.json({ path: dir, items });
+  } catch (e) { res.status(400).json({ error: e.message }); }
+});
 
-    let webContext = '';
-    if (useResearch && research.shouldResearch(lastUserMessage)) {
-      send({ type: 'status', message: '🌐 Researching the web...' });
-      const results = await research.research(lastUserMessage, (p) => send({ type: 'status', message: p.message }));
-      webContext = research.formatResearchContext(results);
-      if (webContext) send({ type: 'research', found: true });
-    }
+app.get('/api/file', (req, res) => {
+  const { path: fp } = req.query;
+  if (!fp) return res.status(400).json({ error: 'path required' });
+  try {
+    res.json({ content: fs.readFileSync(fp, 'utf8'), path: fp });
+  } catch (e) { res.status(400).json({ error: e.message }); }
+});
 
-    const memoryContext = memory.getMemoryContext();
+app.post('/api/file', (req, res) => {
+  const { path: fp, content } = req.body;
+  if (!fp) return res.status(400).json({ error: 'path required' });
+  try {
+    fs.mkdirSync(path.dirname(fp), { recursive: true });
+    fs.writeFileSync(fp, content, 'utf8');
+    res.json({ ok: true });
+  } catch (e) { res.status(400).json({ error: e.message }); }
+});
 
-    const systemPrompt = [
-      'You are an expert AI coding assistant built into MyIDE. You help write, debug, refactor, and understand code.',
-      memoryContext,
-      ragContext,
-      webContext,
-      fileContext ? `## Currently open file:\n\`\`\`\n${fileContext}\n\`\`\`` : '',
-      'When writing code: use proper markdown fences with language tags. For new files, start with FILE: path/to/file.ext'
-    ].filter(Boolean).join('\n\n');
+app.post('/api/file/new', (req, res) => {
+  const { path: fp } = req.body;
+  if (!fp) return res.status(400).json({ error: 'path required' });
+  try {
+    fs.mkdirSync(path.dirname(fp), { recursive: true });
+    if (!fs.existsSync(fp)) fs.writeFileSync(fp, '', 'utf8');
+    res.json({ ok: true });
+  } catch (e) { res.status(400).json({ error: e.message }); }
+});
 
-    send({ type: 'status', message: '' });
-    let fullResponse = '';
+app.delete('/api/file', (req, res) => {
+  const { path: fp } = req.query;
+  if (!fp) return res.status(400).json({ error: 'path required' });
+  try {
+    const stat = fs.statSync(fp);
+    if (stat.isDirectory()) fs.rmSync(fp, { recursive: true });
+    else fs.unlinkSync(fp);
+    res.json({ ok: true });
+  } catch (e) { res.status(400).json({ error: e.message }); }
+});
 
-    if (model === 'claude') {
-      const stream = anthropic.messages.stream({ model: 'claude-opus-4-6', max_tokens: 4096, system: systemPrompt, messages: messages.map(m => ({ role: m.role, content: m.content })) });
-      stream.on('text', (text) => { fullResponse += text; send({ type: 'text', text }); });
-      await stream.finalMessage();
+// ── ollama status ─────────────────────────────────────────────────────────────
+app.get('/api/ollama/status', async (req, res) => {
+  const host = process.env.OLLAMA_HOST || 'http://localhost:11434';
+  try {
+    const r = await fetch(`${host}/api/tags`, { signal: AbortSignal.timeout(2500) });
+    if (r.ok) {
+      const data = await r.json();
+      res.json({ running: true, models: (data.models || []).map(m => m.name) });
     } else {
-      const stream = await openai.chat.completions.create({ model: 'gpt-4o', stream: true, messages: [{ role: 'system', content: systemPrompt }, ...messages.map(m => ({ role: m.role, content: m.content }))] });
-      for await (const chunk of stream) { const text = chunk.choices[0]?.delta?.content || ''; if (text) { fullResponse += text; send({ type: 'text', text }); } }
+      res.json({ running: false, models: [] });
     }
-
-    send({ type: 'done' });
-    res.end();
-    memory.extractMemories(lastUserMessage, fullResponse).catch(() => {});
-  } catch (e) { send({ type: 'error', error: e.message }); res.end(); }
+  } catch { res.json({ running: false, models: [] }); }
 });
 
-// ─── Multi-Agent Team ─────────────────────────────────────────────────────────
-app.post('/api/agents/run', async (req, res) => {
-  const { userRequest, model, fileContext } = req.body;
-  res.setHeader('Content-Type', 'text/event-stream');
-  res.setHeader('Cache-Control', 'no-cache');
-  res.setHeader('Connection', 'keep-alive');
-  const send = (data) => res.write(`data: ${JSON.stringify(data)}\n\n`);
+// ── AI chat — SSE streaming ───────────────────────────────────────────────────
+app.post('/api/ai/chat', async (req, res) => {
+  const {
+    messages,
+    model       = 'ollama',
+    ollamaModel = process.env.OLLAMA_MODEL || 'qwen2.5-coder:7b',
+    fileContext,
+    filePath,
+  } = req.body;
+
+  sseInit(res);
+
+  const system = [
+    'You are an expert AI coding assistant inside MyIDE.',
+    'Write clean, idiomatic code. Always use markdown code fences with language tags.',
+    fileContext
+      ? `## Current file: ${filePath || 'untitled'}\n\`\`\`\n${fileContext.slice(0, 8000)}\n\`\`\``
+      : '',
+  ].filter(Boolean).join('\n\n');
+
+  const full = [{ role: 'system', content: system }, ...messages];
 
   try {
-    const memoryContext = memory.getMemoryContext();
-    let ragContext = '';
-    if (rag.getStatus().indexed) {
-      send({ type: 'status', message: '🔍 Searching codebase for context...' });
-      const results = await rag.search(userRequest, 4);
-      ragContext = rag.formatContext(results);
-    }
-    await agents.runTeam({ anthropicClient: anthropic, openaiClient: openai, model: model || 'claude', userRequest, fileContext, ragContext, memoryContext, onEvent: send });
-    memory.extractMemories(userRequest, '').catch(() => {});
-  } catch (e) { send({ type: 'error', error: e.message }); res.end(); }
-});
+    if      (model === 'ollama') await streamOllama(full, ollamaModel, res);
+    else if (model === 'claude') await streamClaude(full, res);
+    else if (model === 'gpt')    await streamGPT(full, res);
+    else sse(res, { error: `Unknown model: ${model}` });
+  } catch (e) { sse(res, { error: e.message }); }
 
-// ─── RAG API ──────────────────────────────────────────────────────────────────
-app.post('/api/rag/index', async (req, res) => {
-  res.setHeader('Content-Type', 'text/event-stream');
-  res.setHeader('Cache-Control', 'no-cache');
-  res.setHeader('Connection', 'keep-alive');
-  await rag.indexWorkspace(req.body.workspace || currentWorkspace, (p) => res.write(`data: ${JSON.stringify(p)}\n\n`));
-  res.write(`data: ${JSON.stringify({ status: 'complete' })}\n\n`);
+  sse(res, { done: true });
   res.end();
 });
-app.get('/api/rag/status', (req, res) => res.json(rag.getStatus()));
-app.post('/api/rag/search', async (req, res) => { const results = await rag.search(req.body.query, req.body.topK || 5); res.json({ results: results.map(r => ({ ...r.chunk, score: r.score })) }); });
 
-// ─── Memory API ───────────────────────────────────────────────────────────────
-app.get('/api/memory', (req, res) => res.json({ memories: memory.getAll() }));
-app.post('/api/memory', (req, res) => res.json(memory.addManual(req.body.fact)));
-app.delete('/api/memory/:index', (req, res) => res.json(memory.deleteMemory(parseInt(req.params.index))));
-app.delete('/api/memory', (req, res) => res.json(memory.clearAll()));
-
-// ─── WebSocket Terminal ───────────────────────────────────────────────────────
-wss.on('connection', (ws) => {
-  let ptyProcess = null;
-  let watcher = null;
-  ws.on('message', (raw) => {
-    let msg; try { msg = JSON.parse(raw); } catch { return; }
-    if (msg.type === 'terminal:start') {
-      try {
-        const pty = require('node-pty');
-        ptyProcess = pty.spawn(process.env.SHELL || '/bin/zsh', [], { name: 'xterm-256color', cols: msg.cols || 80, rows: msg.rows || 24, cwd: currentWorkspace, env: process.env });
-        ptyProcess.onData((data) => { if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify({ type: 'terminal:data', data })); });
-        ptyProcess.onExit(() => { if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify({ type: 'terminal:exit' })); });
-      } catch (e) { ws.send(JSON.stringify({ type: 'terminal:error', error: 'node-pty not available' })); }
-    }
-    if (msg.type === 'terminal:input' && ptyProcess) ptyProcess.write(msg.data);
-    if (msg.type === 'terminal:resize' && ptyProcess) ptyProcess.resize(msg.cols, msg.rows);
-    if (msg.type === 'watch:start') {
-      watcher = chokidar.watch(msg.path || currentWorkspace, { ignored: /(node_modules|\.git|__pycache__)/, persistent: true, depth: 5 });
-      const notify = (ev, fp) => { if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify({ type: 'watch:change', event: ev, path: fp })); };
-      watcher.on('add', p => notify('add', p)); watcher.on('unlink', p => notify('unlink', p));
-      watcher.on('addDir', p => notify('addDir', p)); watcher.on('unlinkDir', p => notify('unlinkDir', p));
-    }
+async function streamOllama(messages, model, res) {
+  const host = process.env.OLLAMA_HOST || 'http://localhost:11434';
+  const r = await fetch(`${host}/api/chat`, {
+    method:  'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body:    JSON.stringify({ model, messages, stream: true }),
+    signal:  AbortSignal.timeout(120_000),
   });
-  ws.on('close', () => { if (ptyProcess) ptyProcess.kill(); if (watcher) watcher.close(); });
+  if (!r.ok) throw new Error(`Ollama ${r.status}: ${await r.text()}`);
+  const reader  = r.body.getReader();
+  const decoder = new TextDecoder();
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    for (const line of decoder.decode(value, { stream: true }).split('\n').filter(Boolean)) {
+      try {
+        const j = JSON.parse(line);
+        if (j.message?.content) sse(res, { token: j.message.content });
+      } catch { /* skip */ }
+    }
+  }
+}
+
+async function streamClaude(messages, res) {
+  const key = process.env.ANTHROPIC_API_KEY;
+  if (!key || key === 'your_anthropic_api_key_here')
+    throw new Error('ANTHROPIC_API_KEY not set in .env');
+  const { default: Anthropic } = require('@anthropic-ai/sdk');
+  const client  = new Anthropic({ apiKey: key });
+  const sysMsg  = messages.find(m => m.role === 'system')?.content || '';
+  const chat    = messages.filter(m => m.role !== 'system').map(m => ({ role: m.role, content: m.content }));
+  const stream  = client.messages.stream({
+    model:      process.env.CLAUDE_MODEL || 'claude-sonnet-4-6',
+    max_tokens: 4096,
+    system:     sysMsg,
+    messages:   chat,
+  });
+  stream.on('text', t => sse(res, { token: t }));
+  await stream.finalMessage();
+}
+
+async function streamGPT(messages, res) {
+  const key = process.env.OPENAI_API_KEY;
+  if (!key) throw new Error('OPENAI_API_KEY not set in .env');
+  const { default: OpenAI } = require('openai');
+  const client = new OpenAI({ apiKey: key });
+  const stream = await client.chat.completions.create({
+    model:    'gpt-4o',
+    messages: messages.map(m => ({ role: m.role, content: m.content })),
+    stream:   true,
+  });
+  for await (const chunk of stream) {
+    const t = chunk.choices[0]?.delta?.content;
+    if (t) sse(res, { token: t });
+  }
+}
+
+// ── WebSocket: upgrade routing ────────────────────────────────────────────────
+server.on('upgrade', (req, socket, head) => {
+  if (new URL(req.url, `http://${req.headers.host}`).pathname === '/terminal') {
+    wss.handleUpgrade(req, socket, head, ws => wss.emit('connection', ws));
+  } else {
+    socket.destroy();
+  }
 });
 
+// ── WebSocket: real terminal via node-pty ─────────────────────────────────────
+wss.on('connection', (ws) => {
+  let pty = null;
+  try {
+    const nodePty = require('node-pty');
+    pty = nodePty.spawn(process.env.SHELL || '/bin/zsh', [], {
+      name: 'xterm-256color',
+      cols: 80, rows: 24,
+      cwd:  os.homedir(),
+      env:  { ...process.env, TERM: 'xterm-256color', COLORTERM: 'truecolor' },
+    });
+    pty.onData(d => ws.readyState === WebSocket.OPEN && ws.send(JSON.stringify({ type: 'output', data: d })));
+    pty.onExit(({ exitCode }) => ws.readyState === WebSocket.OPEN && ws.send(JSON.stringify({ type: 'exit', code: exitCode })));
+  } catch (e) {
+    ws.readyState === WebSocket.OPEN && ws.send(JSON.stringify({
+      type: 'output',
+      data: `\r\n\x1b[33m⚠ Terminal unavailable: ${e.message}\x1b[0m\r\nRun: npm install\r\n`,
+    }));
+  }
+
+  ws.on('message', raw => {
+    try {
+      const { type, data, cols, rows } = JSON.parse(raw.toString());
+      if (!pty) return;
+      if (type === 'input')  pty.write(data);
+      if (type === 'resize') pty.resize(Math.max(1, cols), Math.max(1, rows));
+    } catch { /* ignore */ }
+  });
+
+  ws.on('close', () => { try { pty?.kill(); } catch { /* dead */ } });
+});
+
+// ── start ─────────────────────────────────────────────────────────────────────
 const PORT = process.env.PORT || 3000;
 server.listen(PORT, () => {
-  console.log(`\n✦ MyIDE v2 running at http://localhost:${PORT}`);
-  console.log(`📁 Workspace: ${currentWorkspace}`);
-  console.log(`🧠 Memory: ${memory.getAll().length} memories loaded`);
-  console.log(`📚 RAG: ${rag.getStatus().indexed ? rag.getStatus().chunks + ' chunks indexed' : 'not indexed yet'}`);
-  console.log(`\nPress Ctrl+C to stop.\n`);
+  const hasClaude = !!(process.env.ANTHROPIC_API_KEY?.length > 10 && process.env.ANTHROPIC_API_KEY !== 'your_anthropic_api_key_here');
+  const hasGPT    = !!(process.env.OPENAI_API_KEY?.length > 10);
+  console.log(`\n✦ MyIDE v3  →  \x1b[36mhttp://localhost:${PORT}\x1b[0m`);
+  console.log(`  AI primary : \x1b[32mOllama\x1b[0m (${process.env.OLLAMA_MODEL || 'qwen2.5-coder:7b'})`);
+  console.log(`  Claude     : ${hasClaude ? '\x1b[32m✓\x1b[0m' : '✗ (add ANTHROPIC_API_KEY to .env)'}`);
+  console.log(`  GPT-4o     : ${hasGPT    ? '\x1b[32m✓\x1b[0m' : '✗ (add OPENAI_API_KEY to .env)'}`);
+  console.log(`\n  Press Ctrl+C to stop.\n`);
 });
+
+module.exports = { server, PORT };

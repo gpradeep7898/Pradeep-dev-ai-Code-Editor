@@ -1,68 +1,32 @@
-# MyIDE v2 ✦ AI-Powered Code Editor
+# ✦ MyIDE v3 — Fast Local AI Code Editor
 
-A fully-featured, browser-based AI code editor powered by Claude (Anthropic) and OpenAI, with RAG, persistent memory, multi-agent workflows, and live research capabilities.
+A browser-based + native Mac IDE with Ollama as primary AI (free, local, instant).
 
-## Features
-
-- **AI Chat** — Claude-powered code assistant with file context
-- **RAG (Retrieval-Augmented Generation)** — Index your codebase for semantic search
-- **Persistent Memory** — Remembers context across sessions
-- **Multi-Agent Workflows** — Specialized agents for different tasks
-- **Research Mode** — Live web research integrated into your editor
-- **File Explorer** — Browse, create, edit, and delete files
-- **Terminal** — Run commands directly in the browser
-- **Real-time sync** — File watcher via WebSocket
-
-## Setup
+## Quick start
 
 ```bash
-# 1. Clone the repo
-git clone https://github.com/gpradeep7898/Pradeep-dev-ai-Code-Editor.git
-cd Pradeep-dev-ai-Code-Editor
-
-# 2. Install dependencies
-npm install
-
-# 3. Configure environment
-cp .env.example .env
-# Edit .env with your API keys
-
-# 4. Start the server
-npm start
+bash setup.sh       # install deps, pull Ollama model
+npm start           # open http://localhost:3000
 ```
 
-Then open [http://localhost:3000](http://localhost:3000) in your browser.
+## Electron (native Mac app)
 
-## Environment Variables
-
-| Variable | Description | Required |
-|---|---|---|
-| `ANTHROPIC_API_KEY` | Your Anthropic API key | Yes |
-| `OPENAI_API_KEY` | Your OpenAI API key (for embeddings) | Yes |
-| `PORT` | Server port (default: 3000) | No |
-| `DEFAULT_WORKSPACE` | Default workspace path | No |
-
-## Project Structure
-
-```
-myide/
-├── server/
-│   ├── index.js          # Express server + WebSocket
-│   └── modules/
-│       ├── rag.js        # RAG / vector search
-│       ├── memory.js     # Persistent memory
-│       ├── agents.js     # Multi-agent workflows
-│       └── research.js   # Live research
-├── public/
-│   ├── index.html        # Main UI
-│   ├── css/style.css     # Styles
-│   └── js/
-│       ├── app.js        # Core app logic
-│       └── features.js   # Feature modules
-├── package.json
-└── .env.example
+```bash
+npm run electron    # dev mode — opens native window
+npm run build       # build MyIDE.app + MyIDE.dmg → dist/
 ```
 
-## License
+## AI Priority
+1. **Ollama** (free, local) — `qwen2.5-coder:7b`
+2. **Claude** — add `ANTHROPIC_API_KEY` to `.env`
+3. **GPT-4o** — add `OPENAI_API_KEY` to `.env`
 
-MIT
+## Features
+- Monaco Editor (VS Code engine)
+- File tree — browse any folder on your Mac
+- Multi-tab editor with ⌘S save
+- Real terminal (node-pty + xterm.js)
+- Streaming AI chat with code actions (Copy / Insert / Save)
+- Model switcher in UI
+- Resizable panels
+- Dark theme with purple accent
